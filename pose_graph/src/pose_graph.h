@@ -84,23 +84,28 @@ private:
 
 	int detectLoop(KeyFrame *keyframe, int frame_index); // detect loop function to check for loop detects and set flag, also call Pnp function to set positions between frames
 	void addKeyFrameIntoVoc(KeyFrame *keyframe);		 // adds keyframe into vocabulary
+	void loopDetectionNClosure();
 	void optimize4DoF();
 	void updatePath();
 
 	list<KeyFrame *> keyframelist; // all keyframe
+	std::queue<KeyFrame*> temp_buf, data_buf; 
 
 	std::mutex m_keyframelist; // mutex lock for keyframelist
 	std::mutex m_optimize_buf; // mutext lock for for optimize_buf
 	std::mutex m_path;		   // mutex lock for path
 	std::mutex m_drift;		   // mutext lock for drift
 	std::mutex m_posegraph;	   // mutex lock for posegraph
+	std::mutex m_loop_detect;  // mutex lock for loop_data_buf
 
+	std::thread t_loop_detect;  // thread for loop detection and closing
 	std::thread t_optimization; // thread for optimization
 
 	// for information sharing between mutex locks
 	std::queue<int> optimize_buf; // for optimization
-	int addedFactorsTill;		  // to keep track of last keyframe added to factorgraph
+	// int addedFactorsTill;		  // to keep track of last keyframe added to factorgraph
 
+	bool FLAG_DETECT_LOOP;
 	int global_index;
 	int sequence_cnt;
 	std::vector<bool> sequence_loop; // keeps track if the sequence has detected a loop clousre with any other sequence

@@ -13,13 +13,14 @@ PoseGraph::PoseGraph()
     odometryModel = gtsam::noiseModel::Diagonal::Sigmas((Eigen::VectorXd(6) << 1e-5, 1e-5, 1e-5, 1e-3, 1e-3, 1e-3).finished());
     loopModel = gtsam::noiseModel::Diagonal::Sigmas((Eigen::VectorXd(6) << 0.001, 0.001, 0.001, 0.05, 0.05, 0.05).finished());
     infiModel = gtsam::noiseModel::Isotropic::Sigmas((Eigen::VectorXd(6) << 6.283, 6.283, 6.283, 10000, 10000, 10000).finished());
-    addedFactorsTill = -1;
+    // addedFactorsTill = -1;
 
     // setting up params for gtsam optimizer
     params.relativeErrorTol = 1e-6;
     params.maxIterations = 10000;
 
     t_optimization = std::thread(&PoseGraph::optimize4DoF, this); // thread to run optimization
+    t_loop_detect = std::thread(&PoseGraph::loopDetectionNClosure, this);
 
     earliest_loop_index = -1;              // Index of earliest loop closure to optimize only after that
     t_drift = Eigen::Vector3d(0, 0, 0);    // Invariant for translation drift Vector
@@ -36,7 +37,8 @@ PoseGraph::PoseGraph()
 // destructor for Posegraph
 PoseGraph::~PoseGraph()
 {
-    t_optimization.join(); // empty the thread
+    t_optimization.join();
+    t_loop_detect.join();
 }
 
 // for Ros Publishers to advertise topics : pose_graph_path, base_path, path_1, path_3 .... till 9
@@ -60,6 +62,7 @@ void PoseGraph::loadVocabulary(std::string voc_path, std::string netvlad_path)
 // To add keyframe into pose graph (gtsam implementation here)
 void PoseGraph::addKeyFrame(KeyFrame *cur_kf, bool flag_detect_loop)
 {
+    FLAG_DETECT_LOOP = flag_detect_loop;
     Vector3d vio_P_cur;
     Matrix3d vio_R_cur;
     printf("\n--> Keyframe added %d, ", cur_kf->index);
@@ -85,109 +88,49 @@ void PoseGraph::addKeyFrame(KeyFrame *cur_kf, bool flag_detect_loop)
     cur_kf->getVioPose(vio_P_cur, vio_R_cur);
     vio_P_cur = w_r_vio * vio_P_cur + w_t_vio;
     vio_R_cur = w_r_vio * vio_R_cur;
-    cur_kf->updateVioPose(vio_P_cur, vio_R_cur);
-    // updates VioPose of current keyframe before using it for calculation in factor graph
-
+    cur_kf->updateVioPose(vio_P_cur, vio_R_cur); // updates VioPose of current keyframe before using it for calculation in factor graph
     cur_kf->index = global_index;
     global_index++;
-    int loop_index = -1;
-    int loop_flag = -1; // to add only factor edge
 
-    // m_posegraph.lock();
-    // flag_detect_loop is to check if loop detection is turned on or not
-    if (flag_detect_loop)
+    m_posegraph.lock();
+
+    if (cur_kf->index == 0)
     {
-        TicToc tmp_t; // time start before loop detection and ending of frame addition
-        tmp_t.tic();
-        loop_index = detectLoop(cur_kf, cur_kf->index);
-        std::cout << "(frame_index, loop_index, time) = ("<<cur_kf->index<<", "<<loop_index<<", "<<tmp_t.toc()<<")\n";
+        Matrix3d R0;
+        Vector3d P0;
+        cur_kf->getVioPose(P0, R0);
+        initial.insert(cur_kf->index, gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0)));
+        graph.addPrior(cur_kf->index, gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0)), priorModel);
+    }
+    else if (new_seq == 1)
+    {
+        // add prior for the new sequence
+        Matrix3d R0;
+        Vector3d P0;
+        cur_kf->getVioPose(P0, R0);
+        initial.insert(cur_kf->index, gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0)));
+        graph.addPrior(cur_kf->index, gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0, 1, 0, 0, 0, 1), gtsam::Point3(0, 0, 0)), infiModel);
     }
     else
     {
-        // when flag is off, just add keyframe into for data recording for offline slam maybe
-        addKeyFrameIntoVoc(cur_kf);
+        // normal edge
+        Vector3d P0, P1, Pf;
+        Matrix3d R0, R1, Rf;
+        cur_kf->getVioPose(P1, R1);
+        getKeyFrame(cur_kf->index - 1)->getVioPose(P0, R0);
+
+        gtsam::Pose3 T0 = gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0));
+        gtsam::Pose3 T1 = gtsam::Pose3(gtsam::Rot3(R1), gtsam::Point3(P1));
+        gtsam::Pose3 Tf = T0.inverse() * T1;
+
+        Rf = R0 * R1.transpose();
+        Pf = R1 * (P1 - P0);
+        initial.insert(cur_kf->index, gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0)));
+        graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(cur_kf->index - 1, cur_kf->index, Tf, odometryModel);
+        // graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(cur_kf->index - 1, cur_kf->index, gtsam::Pose3(gtsam::Rot3(Rf), gtsam::Point3(Pf)), odometryModel);
     }
 
-    // if any loop was detected only then process the loop before adding new keyframe
-    if (loop_index != -1)
-    {
-        // printf(" %d detect loop with %d \n", cur_kf->index, loop_index);
-        KeyFrame *old_kf = getKeyFrame(loop_index); // to get keyframe with which loop has been detected
-
-        if (cur_kf->findConnection(old_kf))
-        {
-            if (earliest_loop_index > loop_index || earliest_loop_index == -1)
-                earliest_loop_index = loop_index;
-
-            Vector3d w_P_old, w_P_cur, vio_P_cur;
-            Matrix3d w_R_old, w_R_cur, vio_R_cur;
-            old_kf->getVioPose(w_P_old, w_R_old); // refer to optimized path instead of vio path //TODO
-            cur_kf->getVioPose(vio_P_cur, vio_R_cur);
-
-            Vector3d relative_t;
-            Quaterniond relative_q;
-            relative_t = cur_kf->getLoopRelativeT();
-            relative_q = (cur_kf->getLoopRelativeQ()).toRotationMatrix();
-            w_P_cur = w_R_old * relative_t + w_P_old;
-            w_R_cur = w_R_old * relative_q;
-            double shift_yaw;
-            Matrix3d shift_r;
-            Vector3d shift_t;
-            shift_yaw = Utility::R2ypr(w_R_cur).x() - Utility::R2ypr(vio_R_cur).x(); // can be made 6DOF
-            shift_r = Utility::ypr2R(Vector3d(shift_yaw, 0, 0));
-            shift_t = w_P_cur - w_R_cur * vio_R_cur.transpose() * vio_P_cur; // shift is the difference between vio and world frame wrt this loop closure
-
-            // 4DOF math can be updated to 6DOF math for loop detection, might be because the PNP is not accurate in other angles
-            Vector3d gtsam_rel_t;
-            Quaterniond gtsam_rel_q;
-            double gtsam_rel_yaw;
-            gtsam_rel_t = cur_kf->getLoopRelativeT();
-            // Matrix3d rela_q = (cur_kf->getLoopRelativeQ()).toRotationMatrix(); // to do 6DOF instead of 4DOF
-            gtsam_rel_yaw = cur_kf->getLoopRelativeYaw();
-            gtsam_rel_q = Utility::ypr2R(Vector3d(gtsam_rel_yaw, 0, 0));
-            Matrix3d gtsam_rel_r = gtsam_rel_q.toRotationMatrix();
-            m_posegraph.lock();
-            Matrix3d RI;
-            Vector3d PI;
-            cur_kf->getVioPose(PI, RI);
-            double lock = gtsam_rel_t.norm() / 5;
-            gtsam::noiseModel::Diagonal::shared_ptr loop_noise = gtsam::noiseModel::Diagonal::Sigmas((Eigen::VectorXd(6) << 0.05, 0.05, 0.05, lock, lock, lock).finished());
-            graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(old_kf->index, cur_kf->index, gtsam::Pose3(gtsam::Rot3(gtsam_rel_r), gtsam::Point3(-gtsam_rel_t)), loop_noise);
-            initial.insert(cur_kf->index, gtsam::Pose3(gtsam::Rot3(RI), gtsam::Point3(PI)));
-            loop_flag = 1;
-            m_posegraph.unlock();
-            // shift vio pose of whole sequence to the world frame wrt the first loop closure
-            if (old_kf->sequence != cur_kf->sequence && sequence_loop[cur_kf->sequence] == 0)
-            {
-                w_r_vio = shift_r;
-                w_t_vio = shift_t;
-                vio_P_cur = w_r_vio * vio_P_cur + w_t_vio;
-                vio_R_cur = w_r_vio * vio_R_cur;
-                cur_kf->updateVioPose(vio_P_cur, vio_R_cur);
-                list<KeyFrame *>::iterator it = keyframelist.begin();
-                for (; it != keyframelist.end(); it++)
-                {
-                    if ((*it)->sequence == cur_kf->sequence)
-                    {
-                        Vector3d vio_P_cur;
-                        Matrix3d vio_R_cur;
-                        (*it)->getVioPose(vio_P_cur, vio_R_cur);
-                        vio_P_cur = w_r_vio * vio_P_cur + w_t_vio;
-                        vio_R_cur = w_r_vio * vio_R_cur;
-                        (*it)->updateVioPose(vio_P_cur, vio_R_cur);
-                    }
-                }
-                sequence_loop[cur_kf->sequence] = 1;
-            }
-
-            // Optimize only when loop is detected
-            m_optimize_buf.lock();
-            optimize_buf.push(cur_kf->index);
-            counter++;
-            m_optimize_buf.unlock();
-            std::cout<<"\n~~> Buffer updated with cur_index="<< cur_kf->index<<", counter="<<counter<<std::endl;
-        }
-    }
+    m_posegraph.unlock();
 
     m_keyframelist.lock();
 
@@ -248,72 +191,17 @@ void PoseGraph::addKeyFrame(KeyFrame *cur_kf, bool flag_detect_loop)
         }
     }
 
-    if (SHOW_L_EDGE)
-    {
-        if (cur_kf->has_loop)
-        {
-            // printf("has loop \n");
-            KeyFrame *connected_KF = getKeyFrame(cur_kf->loop_index);
-            Vector3d connected_P, P0;
-            Matrix3d connected_R, R0;
-            connected_KF->getPose(connected_P, connected_R);
-            // cur_kf->getVioPose(P0, R0);
-            cur_kf->getPose(P0, R0);
-            if (cur_kf->sequence > 0)
-            {
-                // printf("add loop into visual \n");
-                posegraph_visualization->add_loopedge(P0, connected_P + Vector3d(VISUALIZATION_SHIFT_X, VISUALIZATION_SHIFT_Y, 0));
-            }
-        }
-    }
-
     // posegraph_visualization->add_pose(P + Vector3d(VISUALIZATION_SHIFT_X, VISUALIZATION_SHIFT_Y, 0), Q);
     keyframelist.push_back(cur_kf);
-
-    m_posegraph.lock();
-
-    addedFactorsTill = cur_kf->index;
-
-    if (loop_flag != 1)
-    {
-        Matrix3d R0;
-        Vector3d P0;
-        cur_kf->getVioPose(P0, R0);
-        // initial.insert(cur_kf->index, gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0)));
-        initial.insert(cur_kf->index, gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0)));
+    
+    temp_buf.push(cur_kf);
+    if(m_loop_detect.try_lock()){
+        while(!temp_buf.empty()){
+            data_buf.push(temp_buf.front());
+            temp_buf.pop();
+        }
+        m_loop_detect.unlock();
     }
-    if (cur_kf->index == 0)
-    {
-        Matrix3d R0;
-        Vector3d P0;
-        cur_kf->getVioPose(P0, R0);
-
-        graph.addPrior(cur_kf->index, gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0)), priorModel);
-    }
-    else if (new_seq == 1)
-    {
-        // add prior for the new sequence
-        graph.addPrior(cur_kf->index, gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0, 1, 0, 0, 0, 1), gtsam::Point3(0, 0, 0)), infiModel);
-    }
-    else
-    {
-        // normal edge
-        Vector3d P0, P1, Pf;
-        Matrix3d R0, R1, Rf;
-        cur_kf->getVioPose(P1, R1);
-        getKeyFrame(cur_kf->index - 1)->getVioPose(P0, R0);
-
-        gtsam::Pose3 T0 = gtsam::Pose3(gtsam::Rot3(R0), gtsam::Point3(P0));
-        gtsam::Pose3 T1 = gtsam::Pose3(gtsam::Rot3(R1), gtsam::Point3(P1));
-        gtsam::Pose3 Tf = T0.inverse() * T1;
-
-        Rf = R0 * R1.transpose();
-        Pf = R1 * (P1 - P0);
-        graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(cur_kf->index - 1, cur_kf->index, Tf, odometryModel);
-        // graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(cur_kf->index - 1, cur_kf->index, gtsam::Pose3(gtsam::Rot3(Rf), gtsam::Point3(Pf)), odometryModel);
-    }
-
-    m_posegraph.unlock();
 
     publish();
 
@@ -323,6 +211,142 @@ void PoseGraph::addKeyFrame(KeyFrame *cur_kf, bool flag_detect_loop)
     // m_optimize_buf.unlock();
 
     m_keyframelist.unlock();
+}
+
+void PoseGraph::loopDetectionNClosure(){
+    
+    KeyFrame* cur_kf;
+    TicToc tmp_t;
+    
+    while(true){
+        
+        while(data_buf.empty()){
+            std::chrono::milliseconds dura5(5);
+            std::this_thread::sleep_for(dura5);
+        }
+        tmp_t.tic();
+        m_loop_detect.lock();
+        cur_kf = data_buf.front();
+        data_buf.pop();
+        m_loop_detect.unlock();
+        
+        int loop_index = -1;
+
+        // m_posegraph.lock();
+        // flag_detect_loop is to check if loop detection is turned on or not
+        if (FLAG_DETECT_LOOP)
+        {
+            TicToc tmp_t; // time start before loop detection and ending of frame addition
+            tmp_t.tic();
+            loop_index = detectLoop(cur_kf, cur_kf->index);
+            std::cout << "(frame_index, loop_index, time) = ("<<cur_kf->index<<", "<<loop_index<<", "<<tmp_t.toc()<<")\n";
+        }
+        else
+        {
+            // when flag is off, just add keyframe into for data recording for offline slam maybe
+            addKeyFrameIntoVoc(cur_kf);
+        }
+
+        // if any loop was detected only then process the loop before adding new keyframe
+        if (loop_index != -1)
+        {
+            // printf(" %d detect loop with %d \n", cur_kf->index, loop_index);
+            KeyFrame *old_kf = getKeyFrame(loop_index); // to get keyframe with which loop has been detected
+
+            if (cur_kf->findConnection(old_kf))
+            {
+                if (earliest_loop_index > loop_index || earliest_loop_index == -1)
+                    earliest_loop_index = loop_index;
+
+                Vector3d w_P_old, w_P_cur, vio_P_cur;
+                Matrix3d w_R_old, w_R_cur, vio_R_cur;
+                old_kf->getVioPose(w_P_old, w_R_old); // refer to optimized path instead of vio path //TODO
+                cur_kf->getVioPose(vio_P_cur, vio_R_cur);
+
+                Vector3d relative_t;
+                Quaterniond relative_q;
+                relative_t = cur_kf->getLoopRelativeT();
+                relative_q = (cur_kf->getLoopRelativeQ()).toRotationMatrix();
+                w_P_cur = w_R_old * relative_t + w_P_old;
+                w_R_cur = w_R_old * relative_q;
+                double shift_yaw;
+                Matrix3d shift_r;
+                Vector3d shift_t;
+                shift_yaw = Utility::R2ypr(w_R_cur).x() - Utility::R2ypr(vio_R_cur).x(); // can be made 6DOF
+                shift_r = Utility::ypr2R(Vector3d(shift_yaw, 0, 0));
+                shift_t = w_P_cur - w_R_cur * vio_R_cur.transpose() * vio_P_cur; // shift is the difference between vio and world frame wrt this loop closure
+
+                // 4DOF math can be updated to 6DOF math for loop detection, might be because the PNP is not accurate in other angles
+                Vector3d gtsam_rel_t;
+                Quaterniond gtsam_rel_q;
+                double gtsam_rel_yaw;
+                gtsam_rel_t = cur_kf->getLoopRelativeT();
+                // Matrix3d rela_q = (cur_kf->getLoopRelativeQ()).toRotationMatrix(); // to do 6DOF instead of 4DOF
+                gtsam_rel_yaw = cur_kf->getLoopRelativeYaw();
+                gtsam_rel_q = Utility::ypr2R(Vector3d(gtsam_rel_yaw, 0, 0));
+                Matrix3d gtsam_rel_r = gtsam_rel_q.toRotationMatrix();
+                m_posegraph.lock();
+                Matrix3d RI;
+                Vector3d PI;
+                cur_kf->getVioPose(PI, RI);
+                double lock = gtsam_rel_t.norm() / 5;
+                gtsam::noiseModel::Diagonal::shared_ptr loop_noise = gtsam::noiseModel::Diagonal::Sigmas((Eigen::VectorXd(6) << 0.05, 0.05, 0.05, lock, lock, lock).finished());
+                graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(old_kf->index, cur_kf->index, gtsam::Pose3(gtsam::Rot3(gtsam_rel_r), gtsam::Point3(-gtsam_rel_t)), loop_noise);
+                // initial.insert(cur_kf->index, gtsam::Pose3(gtsam::Rot3(RI), gtsam::Point3(PI)));
+                // loop_flag = 1;
+                m_posegraph.unlock();
+                // shift vio pose of whole sequence to the world frame wrt the first loop closure
+                if (old_kf->sequence != cur_kf->sequence && sequence_loop[cur_kf->sequence] == 0)
+                {
+                    w_r_vio = shift_r;
+                    w_t_vio = shift_t;
+                    vio_P_cur = w_r_vio * vio_P_cur + w_t_vio;
+                    vio_R_cur = w_r_vio * vio_R_cur;
+                    cur_kf->updateVioPose(vio_P_cur, vio_R_cur);
+                    list<KeyFrame *>::iterator it = keyframelist.begin();
+                    for (; it != keyframelist.end(); it++)
+                    {
+                        if ((*it)->sequence == cur_kf->sequence)
+                        {
+                            Vector3d vio_P_cur;
+                            Matrix3d vio_R_cur;
+                            (*it)->getVioPose(vio_P_cur, vio_R_cur);
+                            vio_P_cur = w_r_vio * vio_P_cur + w_t_vio;
+                            vio_R_cur = w_r_vio * vio_R_cur;
+                            (*it)->updateVioPose(vio_P_cur, vio_R_cur);
+                        }
+                    }
+                    sequence_loop[cur_kf->sequence] = 1;
+                }
+
+                // Optimize only when loop is detected
+                m_optimize_buf.lock();
+                optimize_buf.push(cur_kf->index);
+                counter++;
+                m_optimize_buf.unlock();
+                std::cout<<"\n~~> Buffer updated with cur_index="<< cur_kf->index<<", counter="<<counter<<std::endl;
+            }
+        }
+
+        if (SHOW_L_EDGE)
+        {
+            if (cur_kf->has_loop)
+            {
+                // printf("has loop \n");
+                KeyFrame *connected_KF = getKeyFrame(cur_kf->loop_index);
+                Vector3d connected_P, P0;
+                Matrix3d connected_R, R0;
+                connected_KF->getPose(connected_P, connected_R);
+                // cur_kf->getVioPose(P0, R0);
+                cur_kf->getPose(P0, R0);
+                if (cur_kf->sequence > 0)
+                {
+                    // printf("add loop into visual \n");
+                    posegraph_visualization->add_loopedge(P0, connected_P + Vector3d(VISUALIZATION_SHIFT_X, VISUALIZATION_SHIFT_Y, 0));
+                }
+            }
+        }
+    }
 }
 
 // will need change for gtsam 4.0
